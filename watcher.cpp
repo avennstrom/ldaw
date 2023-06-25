@@ -1,5 +1,6 @@
 #include "watcher.hpp"
 #include "ldaw.hpp"
+#include "compiler.hpp"
 
 extern "C" {
 #include "md5.h"
@@ -7,6 +8,7 @@ extern "C" {
 
 #include <unordered_set>
 #include <fstream>
+#include <random>
 
 #include <wmcodecdsp.h>
 
@@ -35,8 +37,10 @@ std::string GetLastErrorAsString()
 }
 
 static int writeBatchFile(std::wstring path, std::wstring dllname, std::wstring songName) {
-    const std::string vcvars = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat";
-    const std::wstring exedir = getExecutableDirectory();
+    const char* vcvars = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat";
+
+    wchar_t exedir[MAX_PATH];
+    getExecutableDirectory(exedir, _countof(exedir));
 
     std::ofstream f(path);
     if (!f.is_open()) {
@@ -46,27 +50,34 @@ static int writeBatchFile(std::wstring path, std::wstring dllname, std::wstring 
     f << "@echo off\n";
     f << "chcp 65001\n";
     f << "call \"" << vcvars << "\"\n";
-    f << "cl /Od /Zi /LD -I\"" << wstringToUtf8(exedir) << "\" ..\\" << wstringToUtf8(songName) << ".c /link /OUT:" << wstringToUtf8(dllname) << ".dll\n";
+    f << "cl /std:c11 /Od /Zi /LD -I\"" << wstringToUtf8(exedir) << "\" ..\\" << wstringToUtf8(songName) << ".c /link /OUT:" << wstringToUtf8(dllname) << ".dll\n";
 
     return 0;
 }
 
-static int compileSong(Song* song, std::wstring name, std::vector<std::string>& errors, std::vector<std::string>& messages)
+static int compileSong(Song* song, const wchar_t* name, std::vector<std::string>& errors, std::vector<std::string>& messages)
 {
     UUID uuid;
     if (UuidCreate(&uuid) != RPC_S_OK) {
         return 1;
     }
 
-    RPC_WSTR uuidstr;
+    wchar_t* uuidstr;
     if (UuidToString(&uuid, &uuidstr) != RPC_S_OK) {
         return 1;
     }
 
-    const std::wstring intdir = getIntermediateDirectory();
-    const std::wstring bat = intdir + L'\\' + name + L".bat";
-    const std::wstring dllname = name + L"." + uuidstr;
-    const std::wstring dllpath = intdir + L"\\" + dllname + L".dll";
+    wchar_t intdir[MAX_PATH];
+    getIntermediateDirectory(intdir, _countof(intdir));
+
+    wchar_t bat[MAX_PATH];
+    wsprintf(bat, L"%s\\%s.bat", intdir, name);
+
+    wchar_t dllname[MAX_PATH];
+    wsprintf(dllname, L"%s.%s", name, uuidstr);
+
+    wchar_t dllpath[MAX_PATH];
+    wsprintf(dllpath, L"%s\\%s.dll", intdir, dllname);
 
     messages.push_back(wstringToUtf8(name) + ".c -> " + wstringToUtf8(dllname) + ".dll");
 
@@ -102,7 +113,7 @@ static int compileSong(Song* song, std::wstring name, std::vector<std::string>& 
     ZeroMemory(&pi, sizeof(pi));
 
     WCHAR cmdline[256];
-    wsprintf(cmdline, L"/C \"%ws\"", bat.c_str());
+    wsprintf(cmdline, L"/C \"%ws\"", bat);
 
     wchar_t cmd[MAX_PATH];
     DWORD r = GetEnvironmentVariable(TEXT("COMSPEC"), cmd, _countof(cmd));
@@ -110,7 +121,7 @@ static int compileSong(Song* song, std::wstring name, std::vector<std::string>& 
         return 1;
     }
 
-    if (!CreateProcess(cmd, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, intdir.c_str(), &si, &pi)) {
+    if (!CreateProcess(cmd, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, intdir, &si, &pi)) {
         printf("%s\n", GetLastErrorAsString().c_str());
         return 1;
     }
@@ -171,18 +182,23 @@ static int compileSong(Song* song, std::wstring name, std::vector<std::string>& 
         return 1;
     }
 
+    FILE* f = _wfopen(dllpath, L"r");
+    md5File(song->checksum, f);
+    fclose(f);
+
     song->name = name;
     song->filename = dllname;
 
-    song->hModule = LoadLibrary(dllpath.c_str());
+    song->hModule = LoadLibrary(dllpath);
     if (song->hModule == NULL) {
         errors.push_back("Failed to load module!");
         return 1;
     }
 
-    song->getInfo = (GetInfo)GetProcAddress(song->hModule, "info");
-
+    song->info = (Info)GetProcAddress(song->hModule, "info");
+    song->init = (Init)GetProcAddress(song->hModule, "init");
     song->play = (Play)GetProcAddress(song->hModule, "play");
+
     if (song->play == nullptr) {
         errors.push_back("Song is missing entry point.");
         return 1;
@@ -197,7 +213,7 @@ static void writeWavChunkHeader(std::ostream& stream, std::string id, uint32_t s
     stream.write((const char*)&size, sizeof(size));
 }
 
-static int renderSong(std::wstring name, const Song& song, std::vector<std::string>& errors, std::vector<std::string>& messages)
+static int renderSongWav(std::wstring name, const Song& song, std::vector<std::string>& errors, std::vector<std::string>& messages)
 {
     const size_t sampleRate = 44100;
     const size_t seconds = 120 * 2;
@@ -205,10 +221,25 @@ static int renderSong(std::wstring name, const Song& song, std::vector<std::stri
     const size_t channelCount = 1;
     const size_t dataSize = channelCount * sampleCount * sizeof(uint16_t);
 
-    std::vector<int16_t> samples(channelCount * sampleCount);
-    song.play(samples.data(), sampleCount, sampleRate, 0);
+    ldaw_song_info song_info;
+    defaultSongInfo(&song_info);
+    if (song.info != nullptr) {
+        song.info(&song_info);
+    }
 
-    if (true) {
+    std::vector<uint8_t> song_state;
+    if (song_info.state_size > 0) {
+        song_state.resize(song_info.state_size);
+        std::vector<uint8_t> entropy(song_info.entropy_size);
+        std::generate(entropy.begin(), entropy.end(), std::random_device());
+        song.init(song_state.data(), entropy.data());
+    }
+    
+
+    std::vector<int16_t> samples(channelCount * sampleCount);
+    song.play(samples.data(), sampleCount, sampleRate, 0, song_state.data());
+
+    if (false) {
         //CLSID_MP3ACMCodecWrapper
     } 
     else {
@@ -257,7 +288,7 @@ static int renderSong(std::wstring name, const Song& song, std::vector<std::stri
 
         f.close();
 
-        messages.push_back("Done! " + wstringToUtf8(filename));
+        messages.push_back("Export finished: " + wstringToUtf8(filename));
     }
 
     return 0;
@@ -265,15 +296,26 @@ static int renderSong(std::wstring name, const Song& song, std::vector<std::stri
 
 int fileWatcherThreadEntry(FileWatcherThreadContext& ctx)
 {
-    const std::wstring cwd = getWorkingDirectory();
+    wchar_t cwd[256];
+    getWorkingDirectory(cwd, _countof(cwd));
 
     std::unordered_set<std::wstring> songs;
 
+    const auto broadcastSongs = [&]() -> void {
+        UiEvent event;
+        event.type = UiEventType::Songs;
+        for (const std::wstring& song : songs) {
+            event.data.songs.songs.push_back(song);
+        }
+        ctx.feedback->push(event);
+    };
+
     {
-        const std::wstring pattern = cwd + L"\\*";
+        wchar_t pattern[256];
+        wsprintf(pattern, L"%s\\*", cwd);
 
         WIN32_FIND_DATA findData;
-        HANDLE hFindFile = FindFirstFile(pattern.c_str(), &findData);
+        HANDLE hFindFile = FindFirstFile(pattern, &findData);
         do {
             if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 continue;
@@ -287,19 +329,10 @@ int fileWatcherThreadEntry(FileWatcherThreadContext& ctx)
             songs.emplace(filename.substr(0, filename.length() - 2));
         } while (FindNextFile(hFindFile, &findData));
 
-        UiEvent event;
-        event.type = UiEventType::Songs;
-        for (const std::wstring& song : songs) {
-            event.songs.push_back(song);
-        }
-        ctx.feedback->push(event);
+        broadcastSongs();
     }
 
-    struct FileHash {
-        uint8_t data[16];
-    };
-
-    HANDLE hDir = CreateFile(cwd.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
+    HANDLE hDir = CreateFile(cwd, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
     if (hDir == INVALID_HANDLE_VALUE) {
         return 1;
     }
@@ -309,44 +342,58 @@ int fileWatcherThreadEntry(FileWatcherThreadContext& ctx)
     overlapped.hEvent = CreateEvent(NULL, FALSE, FALSE, TEXT("DirectoryChanges"));
 
     bool readChanges = true;
-    char changeBuffer[4 * 1024];
+    char changeBuffer[16 * 1024];
 
     std::wstring currentSong;
     Song song;
+    memset(song.checksum, 0, sizeof(song.checksum));
 
     const auto compileCurrentSong = [&]() {
+        printf("Compiling song...\n");
+
         {
             UiEvent event;
             event.type = UiEventType::SongStatus;
-            event.isCompiling = true;
+            event.data.songStatus.isCompiling = true;
             ctx.feedback->push(event);
         }
 
         UiEvent event;
-        event.isCompiling = false;
         event.type = UiEventType::SongStatus;
+        event.data.songStatus.isCompiling = false;
 
-        song = Song();
-        if (compileSong(&song, currentSong, event.songErrors, event.songMessages) == 0) {
-            event.song = song;
-            event.songName = currentSong;
+        Song newSong;
+        if (compileSong(&newSong, currentSong.c_str(), event.data.songStatus.songErrors, event.data.songStatus.songMessages) == 0) {
+            event.data.songStatus.song = newSong;
+            event.data.songStatus.songName = currentSong;
         }
 
-        ctx.feedback->push(event);
+        //if (memcmp(song.checksum, newSong.checksum, 16) != 0) {
+            song = newSong;
+            ctx.feedback->push(event);
+        //}
     };
 
-    const auto renderCurrentSong = [&](uint64_t durationInSeconds) {
+    const auto renderCurrentSong = [&](uint64_t durationInSeconds, ExportFormat format) {
         {
             UiEvent event;
-            event.type = UiEventType::RenderStatus;
-            event.isRendering = true;
+            event.type = UiEventType::ExportStatus;
+            event.data.exportStatus.isExporting = true;
             ctx.feedback->push(event);
         }
 
         UiEvent event;
-        event.type = UiEventType::RenderStatus;
-        event.isRendering = false;
-        renderSong(currentSong, song, event.renderErrors, event.renderMessages);
+        event.type = UiEventType::ExportStatus;
+        event.data.exportStatus.isExporting = false;
+
+        switch (format) {
+            case ExportFormat::Wav:
+                renderSongWav(currentSong, song, event.data.exportStatus.exportErrors, event.data.exportStatus.exportMessages);
+                break;
+            case ExportFormat::Wasm:
+                compileSongToWasm(currentSong.c_str(), event.data.exportStatus.exportErrors, event.data.exportStatus.exportMessages);
+                break;
+        }
 
         ctx.feedback->push(event);
     };
@@ -366,11 +413,11 @@ int fileWatcherThreadEntry(FileWatcherThreadContext& ctx)
                 case FileWatcherEventType::Exit:
                     return 0;
                 case FileWatcherEventType::SetSong:
-                    currentSong = event.song;
+                    currentSong = event.data.setSong.song;
                     compileCurrentSong();
                     break;
-                case FileWatcherEventType::RenderSong:
-                    renderCurrentSong(event.renderSeconds);
+                case FileWatcherEventType::ExportSong:
+                    renderCurrentSong(event.data.exportSong.durationInSeconds, event.data.exportSong.format);
                     break;
             }
         }
@@ -387,15 +434,40 @@ int fileWatcherThreadEntry(FileWatcherThreadContext& ctx)
         // abomination
         for (const FILE_NOTIFY_INFORMATION* notification = (FILE_NOTIFY_INFORMATION*)changeBuffer; notification != nullptr; notification = (notification->NextEntryOffset == 0 ? nullptr : (FILE_NOTIFY_INFORMATION*)(((char*)notification) + notification->NextEntryOffset))) {
             const std::wstring filename(notification->FileName, notification->FileNameLength / 2);
+            printf("%ws\n", filename.c_str());
+
             if (filename.length() < 2) {
                 continue;
             }
 
-            if (filename[filename.length() - 1] != 'c' || filename[filename.length() - 2] != '.') {
+            if (filename[filename.length() - 2] != '.' || filename[filename.length() - 1] != 'c') {
                 continue;
             }
 
             if (filename.substr(0, filename.length() - 2) != currentSong) {
+                continue;
+            }
+
+            switch (notification->Action) {
+                case FILE_ACTION_ADDED:
+                    printf("FILE_ACTION_ADDED\n");
+                    break;
+                case FILE_ACTION_REMOVED:
+                    printf("FILE_ACTION_REMOVED\n");
+                    break;
+                case FILE_ACTION_MODIFIED:
+                    printf("FILE_ACTION_MODIFIED\n");
+                    break;
+                case FILE_ACTION_RENAMED_OLD_NAME:
+                    printf("FILE_ACTION_RENAMED_OLD_NAME\n");
+                    break;
+                case FILE_ACTION_RENAMED_NEW_NAME:
+                    printf("FILE_ACTION_RENAMED_NEW_NAME\n");
+                    break;
+            }
+
+            if (notification->Action != FILE_ACTION_RENAMED_NEW_NAME &&
+                notification->Action != FILE_ACTION_MODIFIED) {
                 continue;
             }
 

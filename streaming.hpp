@@ -30,7 +30,8 @@ struct StreamingThreadContext {
     UiEventQueue* feedback;
     HWND hWnd;
     uint32_t sampleRate;
-    int16_t* waveformBuffer = NULL;
+    std::vector<int16_t> waveformCapture;
+    std::vector<uint8_t> stateCapture;
 };
 
 int streamingThreadEntry(StreamingThreadContext& ctx);

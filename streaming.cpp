@@ -1,5 +1,7 @@
 #include "streaming.hpp"
 
+#include <random>
+
 #include <dsound.h>
 
 struct BufferCreateInfo
@@ -113,13 +115,27 @@ int streamingThreadEntry(StreamingThreadContext& ctx)
     QueryPerformanceFrequency(&counterFreq);
 
     const size_t waveformBufferSize = bufferInfo.sampleCount * sizeof(int16_t);
-    ctx.waveformBuffer = (int16_t*)malloc(waveformBufferSize);
-    memset(ctx.waveformBuffer, 0, waveformBufferSize);
+    ctx.waveformCapture.resize(waveformBufferSize, 0);
 
     Song song;
     uint64_t baseSample = 0;
     bool debugSong = false;
     int volume = DSBVOLUME_MAX;
+
+    ldaw_song_info songInfo;
+    std::vector<uint8_t> songState;
+
+    const auto initSong = [&song, &songInfo, &songState]() {
+        songState.clear();
+        if (songInfo.state_size > 0) {
+            songState.resize(songInfo.state_size);
+            if (song.init != nullptr) {
+                std::vector<uint8_t> entropy(songInfo.entropy_size);
+                std::generate(entropy.begin(), entropy.end(), std::random_device());
+                song.init(songState.data(), entropy.data());
+            }
+        }
+    };
 
     while (true)
     {
@@ -135,14 +151,23 @@ int streamingThreadEntry(StreamingThreadContext& ctx)
                     case StreamingEventType::SetSong:
                         if (song.hModule != nullptr) {
                             FreeModule(song.hModule);
-                            DeleteFile((getIntermediateDirectory() + L'\\' + song.filename + L".dll").c_str());
-                            DeleteFile((getIntermediateDirectory() + L'\\' + song.filename + L".ilk").c_str());
-                            DeleteFile((getIntermediateDirectory() + L'\\' + song.filename + L".pdb").c_str());
+                            //DeleteFile((getIntermediateDirectory() + L'\\' + song.filename + L".dll").c_str());
+                            //DeleteFile((getIntermediateDirectory() + L'\\' + song.filename + L".ilk").c_str());
+                            //DeleteFile((getIntermediateDirectory() + L'\\' + song.filename + L".pdb").c_str());
                         }
+
                         song = event.song;
+
+                        defaultSongInfo(&songInfo);
+                        if (song.info != nullptr) {
+                            song.info(&songInfo);
+                        }
+
                         if (event.resetPlayback) {
                             baseSample = 0;
                         }
+
+                        initSong();
                         break;
                     case StreamingEventType::DebugSong: 
                         debugSong = true;
@@ -152,6 +177,12 @@ int streamingThreadEntry(StreamingThreadContext& ctx)
                         break;
                     }
                     case StreamingEventType::PlaybackScan: {
+                        if (event.scanOffsetInSeconds == INT64_MIN) {
+                            initSong();
+                            baseSample = 0;
+                            break;
+                        }
+
                         const int64_t scan = -min((int64_t)baseSample, -event.scanOffsetInSeconds * (int64_t)bufferInfo.sampleRate);
                         baseSample += scan;
                         break;
@@ -177,9 +208,10 @@ int streamingThreadEntry(StreamingThreadContext& ctx)
             DebugBreak();
         }
 
-        song.play(bufferSamples + writeOffset, bufferInfo.sampleCount, bufferInfo.sampleRate, baseSample);
+        song.play(bufferSamples + writeOffset, bufferInfo.sampleCount, bufferInfo.sampleRate, baseSample, songState.data());
 
-        memcpy(ctx.waveformBuffer, bufferSamples + writeOffset, bufferInfo.sampleCount* bufferInfo.sampleSize);
+        ctx.stateCapture = songState;
+        memcpy(ctx.waveformCapture.data(), bufferSamples + writeOffset, bufferInfo.sampleCount* bufferInfo.sampleSize);
 
         //LARGE_INTEGER endTime;
         //QueryPerformanceCounter(&endTime);
@@ -192,9 +224,9 @@ int streamingThreadEntry(StreamingThreadContext& ctx)
         {
             UiEvent event;
             event.type = UiEventType::Playback;
-            event.playback.playing = true;
-            event.playback.samples = baseSample;
-            event.playback.seconds = (baseSample / bufferInfo.sampleRate);
+            event.data.playback.playing = true;
+            event.data.playback.samples = baseSample;
+            event.data.playback.seconds = (baseSample / bufferInfo.sampleRate);
             ctx.feedback->push(event);
         }
     }

@@ -1,7 +1,8 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
-int compileSongToWasm(std::wstring name);
+int compileSongToWasm(const wchar_t* name, std::vector<std::string>& errors, std::vector<std::string>& messages);
 int compileSongToDll();
 int compileSongToHTML();

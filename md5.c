@@ -192,8 +192,8 @@ uint8_t* md5String(char* input) {
 	md5Update(&ctx, (uint8_t*)input, strlen(input));
 	md5Finalize(&ctx);
 
-	uint8_t* result = malloc(16);
-	memcpy(result, ctx.digest, 16);
+	uint8_t* result = malloc(MD5_DIGEST_SIZE);
+	memcpy(result, ctx.digest, MD5_DIGEST_SIZE);
 	return result;
 }
 
@@ -210,7 +210,7 @@ void md5File(uint8_t* result, FILE* file) {
 
 	md5Finalize(&ctx);
 
-	memcpy(result, ctx.digest, 16);
+	memcpy(result, ctx.digest, MD5_DIGEST_SIZE);
 }
 
 /*

@@ -1,13 +1,8 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 #include "ldaw.hpp"
 #include "watcher.hpp"
 #include "streaming.hpp"
 
 #include "simple_fft/fft.hpp"
-extern "C" {
-#include "md5.h"
-}
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_impl_glfw.h"
@@ -24,6 +19,8 @@ extern "C" {
 #include <stdio.h>
 #include <dsound.h>
 #include <Shlwapi.h>
+#include <ShlObj.h>
+#include <Windows.h>
 
 #include <thread>
 #include <fstream>
@@ -40,21 +37,30 @@ extern "C" {
 #pragma comment(lib, "shlwapi")
 #pragma comment(lib, "rpcrt4")
 
-std::wstring getExecutableDirectory() {
-    wchar_t dir[MAX_PATH] = { 0 };
-    GetModuleFileName(NULL, dir, MAX_PATH);
-    PathRemoveFileSpec(dir);
-    return std::wstring(dir);
+bool getExecutableDirectory(wchar_t* dir, size_t len) {
+    if (GetModuleFileName(NULL, dir, MAX_PATH) == 0) {
+        return false;
+    }
+
+    if (!PathRemoveFileSpec(dir)) {
+        return false;
+    }
+
+    return true;
 }
 
-std::wstring getWorkingDirectory() {
-    wchar_t cwd[MAX_PATH];
-    GetCurrentDirectory(MAX_PATH, cwd);
-    return std::wstring(cwd);
+bool getWorkingDirectory(wchar_t* dir, size_t len) {
+    GetCurrentDirectory(MAX_PATH, dir);
+    return true;
 }
 
-std::wstring getIntermediateDirectory() {
-    return getWorkingDirectory() + L"\\.ldaw";
+bool getIntermediateDirectory(wchar_t* dir, size_t len) {
+    if (!getWorkingDirectory(dir, len)) {
+        return false;
+    }
+
+    wsprintf(dir, L"%s\\.ldaw", dir);
+    return true;
 }
 
 std::string wstringToUtf8(const std::wstring& s) {
@@ -62,6 +68,15 @@ std::string wstringToUtf8(const std::wstring& s) {
     std::vector<char> buf(len);
     WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.length(), buf.data(), len, nullptr, nullptr);
     return std::string(buf);
+}
+
+bool wstringToUtf8(char* target, size_t target_len, const wchar_t* source, size_t source_len) {
+    const int len = WideCharToMultiByte(CP_UTF8, 0, source, (int)source_len, nullptr, 0, nullptr, nullptr);
+    if (len > target_len) {
+        return false;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, source, (int)source_len, target, len, nullptr, nullptr);
+    return true;
 }
 
 float waveform_getter(void* data, int index)
@@ -88,9 +103,6 @@ static void doMenu(GLFWwindow* window, UiEventQueue* events, StreamingThreadCont
 
     ImPlot::CreateContext();
 
-    //
-    //
-    //
 
     std::wstring selectedSong;
     std::vector<std::wstring> songs;
@@ -101,15 +113,21 @@ static void doMenu(GLFWwindow* window, UiEventQueue* events, StreamingThreadCont
     uint64_t playbackSeconds = 0;
     int volume = DSBVOLUME_MAX;
 
+    int songStateGroupSize = 1;
+
     bool isCompiling = false;
     std::vector<std::string> compileMessages;
     std::vector<std::string> compileErrors;
 
-    bool isRendering = false;
-    std::vector<std::string> renderMessages;
-    std::vector<std::string> renderErrors;
+    bool isExporting = false;
+    std::vector<std::string> exportMessages;
+    std::vector<std::string> exportErrors;
 
     int exportDurationInSeconds = 60;
+
+    ExportFormat exportFormat = ExportFormat::Wav;
+    const char* exportOutputLabels[] = { ".wav", ".wasm" };
+    static_assert(_countof(exportOutputLabels) == (size_t)ExportFormat::Count);
 
     const auto skipPlayback = [&](int64_t seconds) {
         StreamingEvent event;
@@ -123,34 +141,40 @@ static void doMenu(GLFWwindow* window, UiEventQueue* events, StreamingThreadCont
             UiEvent event;
             while (events->pop(event)) {
                 switch (event.type) {
-                    case UiEventType::Songs:
-                        songs = event.songs;
+                    case UiEventType::Songs: {
+                        const auto& data = event.data.songs;
+                        songs = data.songs;
                         break;
+                    }
                     case UiEventType::SongStatus: {
-                        isCompiling = event.isCompiling;
-                        compileMessages = event.songMessages;
-                        compileErrors = event.songErrors;
-                        if (event.song.has_value()) {
-                            currentSongName = wstringToUtf8(event.songName);
+                        const auto& data = event.data.songStatus;
+                        isCompiling = data.isCompiling;
+                        compileMessages = data.songMessages;
+                        compileErrors = data.songErrors;
+                        if (data.song.has_value()) {
+                            currentSongName = wstringToUtf8(data.songName);
 
                             StreamingEvent outEvent;
                             outEvent.type = StreamingEventType::SetSong;
-                            outEvent.song = std::move(event.song.value());
+                            outEvent.song = data.song.value();
                             streaming->queue.push(outEvent);
                         }
                         break;
                     }
-                    case UiEventType::RenderStatus: {
-                        isRendering = event.isRendering;
-                        renderMessages = event.renderMessages;
-                        renderErrors = event.renderErrors;
+                    case UiEventType::ExportStatus: {
+                        const auto& data = event.data.exportStatus;
+                        isExporting = data.isExporting;
+                        exportMessages = data.exportMessages;
+                        exportErrors = data.exportErrors;
                         break;
                     }
-                    case UiEventType::Playback:
-                        isPlaying = event.playback.playing;
-                        playbackSamples = event.playback.samples;
-                        playbackSeconds = event.playback.seconds;
+                    case UiEventType::Playback: {
+                        const auto& data = event.data.playback;
+                        isPlaying = data.playing;
+                        playbackSamples = data.samples;
+                        playbackSeconds = data.seconds;
                         break;
+                    }
                 }
             }
         }
@@ -191,7 +215,7 @@ static void doMenu(GLFWwindow* window, UiEventQueue* events, StreamingThreadCont
                 isCompiling = true;
                 FileWatcherEvent event;
                 event.type = FileWatcherEventType::SetSong;
-                event.song = selectedSong;
+                event.data.setSong.song = selectedSong;
                 files->queue.push(event);
             }
             ImGui::EndDisabled();
@@ -204,7 +228,7 @@ static void doMenu(GLFWwindow* window, UiEventQueue* events, StreamingThreadCont
             }
 
             ImGui::BeginDisabled(!isPlaying || isCompiling);
-            if (ImGui::Button("<<")) { skipPlayback(-(int64_t)UINT32_MAX); } // bold assumption
+            if (ImGui::Button("<<")) { skipPlayback(INT64_MIN); } // bold assumption
             ImGui::SameLine();
             if (ImGui::Button("< 1m")) { skipPlayback(-60); }
             ImGui::SameLine();
@@ -257,41 +281,66 @@ static void doMenu(GLFWwindow* window, UiEventQueue* events, StreamingThreadCont
         }
         ImGui::End();
 
-        if (ImGui::Begin("Render")) {
-            ImGui::InputInt("Seconds", &exportDurationInSeconds);
-            ImGui::Text("Render '%s'", currentSongName.c_str());
+        if (ImGui::Begin("Export")) {
+            ImGui::Combo("Format", (int*)&exportFormat, exportOutputLabels, _countof(exportOutputLabels));
+            if (exportFormat == ExportFormat::Wav) {
+                ImGui::InputInt("Seconds", &exportDurationInSeconds);
+            }
+            ImGui::Text("Export '%s'", currentSongName.c_str());
             if (ImGui::Button("Start")) {
                 FileWatcherEvent event;
-                event.type = FileWatcherEventType::RenderSong;
-                event.renderSeconds = exportDurationInSeconds;
+                event.type = FileWatcherEventType::ExportSong;
+                event.data.exportSong.durationInSeconds = exportDurationInSeconds;
+                event.data.exportSong.format = exportFormat;
                 files->queue.push(event);
             }
 
-            if (isRendering) {
-                ImGui::Text("Rendering...");
+            if (isExporting) {
+                ImGui::Text("Exporting...");
             }
 
-            for (const std::string& msg : renderMessages) {
+            for (const std::string& msg : exportMessages) {
                 ImGui::TextWrapped(msg.c_str());
                 ImGui::Separator();
             }
 
-            for (const std::string& err : renderErrors) {
+            for (const std::string& err : exportErrors) {
                 ImGui::TextWrapped(err.c_str());
                 ImGui::Separator();
             }
         }
         ImGui::End();
 
+        ImGui::Begin("State");
+        {
+            ImGui::SliderInt("Group size", &songStateGroupSize, 0, 16);
+
+            std::string hex;
+            for (size_t i = 0; i < streaming->stateCapture.size(); ++i) {
+                const uint8_t lo = streaming->stateCapture[i] & 0xf;
+                const uint8_t hi = streaming->stateCapture[i] >> 4;
+
+                hex += (hi >= 10) ? ('a' + (hi - 10)) : ('0' + hi);
+                hex += (lo >= 10) ? ('a' + (lo - 10)) : ('0' + lo);
+
+                if (i % songStateGroupSize == (songStateGroupSize - 1)) {
+                    hex += '\n';
+                }
+            }
+
+            ImGui::Text("%s", hex.c_str());
+        }
+        ImGui::End();
+
         ImGui::Begin("Waveform");
         {
             if (ImPlot::BeginPlot("Waveform", ImVec2(-1, -1), ImPlotFlags_NoFrame | ImPlotFlags_CanvasOnly | ImPlotFlags_AntiAliased)) {
-                if (streaming->waveformBuffer != nullptr) {
+                if (!streaming->waveformCapture.empty()) {
                     ImPlot::SetupAxis(ImAxis_X1, NULL, ImPlotAxisFlags_NoDecorations);
                     ImPlot::SetupAxis(ImAxis_Y1, NULL, ImPlotAxisFlags_NoDecorations);
                     ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, 2048.0, ImPlotCond_Always);
                     ImPlot::SetupAxisLimits(ImAxis_Y1, (double)INT16_MIN, (double)INT16_MAX, ImPlotCond_Always);
-                    ImPlot::PlotLine("Waveform", (int16_t*)streaming->waveformBuffer, 2048);
+                    ImPlot::PlotLine("Waveform", streaming->waveformCapture.data(), 2048);
                 }
                 ImPlot::EndPlot();
             }
@@ -301,13 +350,13 @@ static void doMenu(GLFWwindow* window, UiEventQueue* events, StreamingThreadCont
         ImGui::Begin("Spectrum");
         {
             if (ImPlot::BeginPlot("Spectrum", ImVec2(-1, -1), ImPlotFlags_NoFrame | ImPlotFlags_CanvasOnly | ImPlotFlags_AntiAliased)) {
-                if (streaming->waveformBuffer != nullptr) {
+                if (!streaming->waveformCapture.empty()) {
 
                     const char* error = nullptr;
 
                     std::vector<real_type> real(2048);
                     for (size_t i = 0; i < 2048; ++i) {
-                        real[i] = (float)streaming->waveformBuffer[i];
+                        real[i] = (float)streaming->waveformCapture[i];
                     }
 
                     std::vector<complex_type> complex(2048);
@@ -343,6 +392,13 @@ static void doMenu(GLFWwindow* window, UiEventQueue* events, StreamingThreadCont
 
 INT WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, INT nCmdShow)
 {
+    AllocConsole();
+
+    FILE* f;
+    freopen_s(&f, "CONIN$", "r", stdin);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    freopen_s(&f, "CONOUT$", "w", stdout);
+
     if (!glfwInit()) {
         return 1;
     }
@@ -356,22 +412,31 @@ INT WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         return 1;
     }
 
+    const HWND hWnd = glfwGetWin32Window(window);
+
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL2_Init();
 
-    std::wstring intdir = getIntermediateDirectory();
-    if (CreateDirectory(intdir.c_str(), NULL)) {
-        SetFileAttributes(intdir.c_str(), FILE_ATTRIBUTE_HIDDEN);
+    wchar_t intdir[MAX_PATH];
+    getIntermediateDirectory(intdir, _countof(intdir));
+
+    if (CreateDirectory(intdir, NULL)) {
+        SetFileAttributes(intdir, FILE_ATTRIBUTE_HIDDEN);
     }
+
+    wchar_t homePath[MAX_PATH + 1];
+    SHGetSpecialFolderPath(hWnd, homePath, CSIDL_LOCAL_APPDATA, FALSE);
+
+
 
     UiEventQueue events;
 
     StreamingThreadContext streamingContext;
     streamingContext.feedback = &events;
-    streamingContext.hWnd = glfwGetWin32Window(window);
+    streamingContext.hWnd = hWnd;
     streamingContext.sampleRate = 44100;
 
     FileWatcherThreadContext fileWatcherContext;
@@ -382,17 +447,8 @@ INT WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     
     doMenu(window, &events, &streamingContext, &fileWatcherContext);
     
-    // signal threads
-    {
-        StreamingEvent event;
-        event.type = StreamingEventType::Exit;
-        streamingContext.queue.push(event);
-    }
-    {
-        FileWatcherEvent event;
-        event.type = FileWatcherEventType::Exit;
-        fileWatcherContext.queue.push(event);
-    }
+    streamingContext.queue.push(StreamingEvent{ StreamingEventType::Exit });
+    fileWatcherContext.queue.push(FileWatcherEvent{ FileWatcherEventType::Exit });
 
     streamingThread.join();
     fileWatcherThread.join();

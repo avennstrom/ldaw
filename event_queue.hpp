@@ -17,10 +17,10 @@ public:
 		CloseHandle(m_hEvent);
 	}
 
-	void push(T& event)
+	void push(const T& event)
 	{
 		const std::lock_guard lock(m_mutex);
-		m_items.push_back(std::move(event));
+		m_items.push_back(event);
 		SetEvent(m_hEvent);
 	}
 
@@ -31,13 +31,8 @@ public:
 			return false;
 		}
 
-		event = std::move(m_items.front());
-
-		for (size_t i = 1; i < m_items.size(); ++i) {
-			m_items[i - 1] = std::move(m_items[i]);
-		}
-		m_items.resize(m_items.size() - 1);
-
+		event = m_items.front();
+		m_items.pop_front();
 		return true;
 	}
 
@@ -49,5 +44,5 @@ public:
 private:
 	std::mutex m_mutex;
 	HANDLE m_hEvent;
-	std::vector<T> m_items;
+	std::deque<T> m_items;
 };
